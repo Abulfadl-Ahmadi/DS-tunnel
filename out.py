@@ -158,6 +158,8 @@ class SessionState:
     chunks_sent: int = 0
     bytes_to_target: int = 0
     bytes_to_in: int = 0
+    acks_received: int = 0
+    last_ack_seq: int = -1
     send_buffer: dict[int, BufferedChunk] = field(default_factory=dict)
     control_error: str = ""
 
@@ -171,11 +173,35 @@ session_stats = {
 }
 
 
+def emit_status_snapshot(reason: str) -> None:
+    with sessions_lock:
+        active = len(sessions)
+    with session_stats_lock:
+        accepted = session_stats["accepted"]
+        last_close = session_stats["last_close"]
+    if last_close:
+        log.info(
+            "status reason=%s active_sessions=%s accepted_sessions=%s last_close=%s",
+            reason,
+            active,
+            accepted,
+            last_close,
+        )
+        return
+    log.info(
+        "status reason=%s active_sessions=%s accepted_sessions=%s",
+        reason,
+        active,
+        accepted,
+    )
+
+
 def register_session(session: SessionState) -> None:
     with sessions_lock:
         sessions[session.session_id] = session
     with session_stats_lock:
         session_stats["accepted"] += 1
+    emit_status_snapshot("session_open")
 
 
 def unregister_session(session_id: int) -> None:
@@ -193,16 +219,20 @@ def close_session(session: SessionState, reason: str) -> None:
     with session_stats_lock:
         session_stats["last_close"] = reason
     log.info(
-        "session=%s closing reason=%s bytes_to_target=%s bytes_to_in=%s chunks_sent=%s acked_upto=%s",
+        "session=%s closing reason=%s bytes_to_target=%s bytes_to_in=%s chunks_sent=%s acked_upto=%s acks_received=%s last_ack_seq=%s pending_chunks=%s",
         session.session_id,
         reason,
         session.bytes_to_target,
         session.bytes_to_in,
         session.chunks_sent,
         session.acked_upto,
+        session.acks_received,
+        session.last_ack_seq,
+        len(session.send_buffer),
     )
     close_socket(session.control_sock)
     close_socket(session.target_sock)
+    emit_status_snapshot("session_close")
 
 
 def send_udp_chunk(session: SessionState, seq_num: int, payload: bytes, flags: int = 0) -> None:
@@ -259,6 +289,8 @@ def handle_control_reader(session: SessionState) -> None:
                 if len(payload) == 4:
                     ack_seq = struct.unpack("!I", payload)[0]
                     with session.state_lock:
+                        session.acks_received += 1
+                        session.last_ack_seq = ack_seq
                         if ack_seq > session.acked_upto:
                             for seq_num in list(session.send_buffer.keys()):
                                 if seq_num <= ack_seq:
@@ -374,13 +406,17 @@ def log_status_loop() -> None:
         total_chunks = sum(session.chunks_sent for session in snapshot)
         total_to_target = sum(session.bytes_to_target for session in snapshot)
         total_to_in = sum(session.bytes_to_in for session in snapshot)
+        sessions_waiting_ack = sum(1 for session in snapshot if session.chunks_sent > 0 and session.acks_received == 0)
+        pending_chunks = sum(len(session.send_buffer) for session in snapshot)
         log.info(
-            "status active_sessions=%s accepted_sessions=%s total_chunks=%s bytes_to_target=%s bytes_to_in=%s",
+            "status active_sessions=%s accepted_sessions=%s total_chunks=%s bytes_to_target=%s bytes_to_in=%s sessions_waiting_ack=%s pending_chunks=%s",
             len(snapshot),
             accepted,
             total_chunks,
             total_to_target,
             total_to_in,
+            sessions_waiting_ack,
+            pending_chunks,
         )
 
 

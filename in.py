@@ -177,17 +177,73 @@ class SessionState:
     bytes_from_client: int = 0
     bytes_from_out: int = 0
     chunks_from_out: int = 0
+    acks_sent: int = 0
+    acks_failed: int = 0
+    last_acked_seq: int = -1
     last_pong: float = field(default_factory=time.monotonic)
     control_error: str = ""
 
 
 sessions: dict[int, SessionState] = {}
 sessions_lock = threading.Lock()
+session_stats_lock = threading.Lock()
+session_stats = {
+    "accepted": 0,
+    "last_close": "",
+}
+
+
+def emit_status_snapshot(reason: str) -> None:
+    with sessions_lock:
+        active = len(sessions)
+    with session_stats_lock:
+        accepted = session_stats["accepted"]
+        last_close = session_stats["last_close"]
+    if last_close:
+        log.info(
+            "status reason=%s active_sessions=%s accepted_sessions=%s last_close=%s",
+            reason,
+            active,
+            accepted,
+            last_close,
+        )
+        return
+    log.info(
+        "status reason=%s active_sessions=%s accepted_sessions=%s",
+        reason,
+        active,
+        accepted,
+    )
+
+
+def run_preflight_checks() -> None:
+    log.info("preflight checking local SOCKS5 proxy at %s:%s", SOCKS5_PROXY[0], SOCKS5_PROXY[1])
+    try:
+        with socket.create_connection(SOCKS5_PROXY, timeout=SOCKS5_CONNECT_TIMEOUT):
+            pass
+        log.info("preflight local SOCKS5 proxy reachable")
+    except Exception as exc:
+        log.error("preflight local SOCKS5 proxy check failed: %s", exc)
+        return
+
+    log.info("preflight checking OUT control via SOCKS5 %s:%s", VPS_OUT_IP, VPS_OUT_CONTROL_PORT)
+    try:
+        probe = socks.socksocket()
+        probe.set_proxy(socks.SOCKS5, SOCKS5_PROXY[0], SOCKS5_PROXY[1])
+        probe.settimeout(SOCKS5_CONNECT_TIMEOUT)
+        probe.connect((VPS_OUT_IP, VPS_OUT_CONTROL_PORT))
+        probe.close()
+        log.info("preflight OUT control is reachable via SOCKS5")
+    except Exception as exc:
+        log.error("preflight OUT control check failed: %s", exc)
 
 
 def register_session(session: SessionState) -> None:
     with sessions_lock:
         sessions[session.session_id] = session
+    with session_stats_lock:
+        session_stats["accepted"] += 1
+    emit_status_snapshot("session_open")
 
 
 def unregister_session(session_id: int) -> None:
@@ -207,7 +263,19 @@ def close_session(session: SessionState, reason: str) -> None:
         session.stop_event.set()
         session.control_error = reason
     unregister_session(session.session_id)
-    log.info("session=%s closing reason=%s", session.session_id, reason)
+    with session_stats_lock:
+        session_stats["last_close"] = reason
+    log.info(
+        "session=%s closing reason=%s bytes_from_client=%s bytes_from_out=%s chunks_from_out=%s acks_sent=%s acks_failed=%s last_acked_seq=%s",
+        session.session_id,
+        reason,
+        session.bytes_from_client,
+        session.bytes_from_out,
+        session.chunks_from_out,
+        session.acks_sent,
+        session.acks_failed,
+        session.last_acked_seq,
+    )
     for sock_obj in (session.client_sock, session.control_sock):
         try:
             sock_obj.shutdown(socket.SHUT_RDWR)
@@ -219,6 +287,7 @@ def close_session(session: SessionState, reason: str) -> None:
             sock_obj.close()
         except Exception:
             pass
+    emit_status_snapshot("session_close")
 
 
 def udp_receiver() -> None:
@@ -284,6 +353,9 @@ def udp_receiver() -> None:
         if delivered and not session.stop_event.is_set():
             try:
                 send_frame(session.control_sock, TYPE_ACK, session.session_id, struct.pack("!I", session.highest_delivered_seq), session.send_lock)
+                with session.state_lock:
+                    session.acks_sent += 1
+                    session.last_acked_seq = session.highest_delivered_seq
                 log.debug(
                     "session=%s acked seq=%s bytes_from_out=%s chunks=%s",
                     session.session_id,
@@ -292,6 +364,8 @@ def udp_receiver() -> None:
                     session.chunks_from_out,
                 )
             except Exception as exc:
+                with session.state_lock:
+                    session.acks_failed += 1
                 close_session(session, f"failed to send ACK: {exc}")
 
 
@@ -485,5 +559,6 @@ def socks5_server() -> None:
 
 if __name__ == "__main__":
     validate_configuration()
+    run_preflight_checks()
     threading.Thread(target=udp_receiver, daemon=True).start()
     socks5_server()
