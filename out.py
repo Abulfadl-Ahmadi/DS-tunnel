@@ -29,6 +29,13 @@ DEFAULT_CONFIG = {
     "listen_host": "0.0.0.0",
     "udp_mtu": 1200,
     "resend_interval": 1.0,
+    "retransmit_scan_interval": 0.05,
+    "max_resends_per_tick": 64,
+    "resend_backoff_factor": 1.4,
+    "max_pending_chunks": 8192,
+    "target_recv_size": 65536,
+    "socket_buffer_bytes": 1048576,
+    "session_close_grace": 0.8,
     "keepalive_interval": 3.0,
     "keepalive_timeout": 10.0,
     "max_retries": 5,
@@ -60,6 +67,13 @@ CONTROL_PORT = int(CONFIG["control_port"])
 LISTEN_HOST = str(CONFIG["listen_host"])
 UDP_MTU = int(CONFIG["udp_mtu"])
 RESEND_INTERVAL = float(CONFIG["resend_interval"])
+RETRANSMIT_SCAN_INTERVAL = float(CONFIG["retransmit_scan_interval"])
+MAX_RESENDS_PER_TICK = int(CONFIG["max_resends_per_tick"])
+RESEND_BACKOFF_FACTOR = float(CONFIG["resend_backoff_factor"])
+MAX_PENDING_CHUNKS = int(CONFIG["max_pending_chunks"])
+TARGET_RECV_SIZE = int(CONFIG["target_recv_size"])
+SOCKET_BUFFER_BYTES = int(CONFIG["socket_buffer_bytes"])
+SESSION_CLOSE_GRACE = float(CONFIG["session_close_grace"])
 KEEPALIVE_INTERVAL = float(CONFIG["keepalive_interval"])
 KEEPALIVE_TIMEOUT = float(CONFIG["keepalive_timeout"])
 MAX_RETRIES = int(CONFIG["max_retries"])
@@ -79,6 +93,8 @@ TYPE_ERROR = 8
 
 TCP_HEADER = struct.Struct("!4sBBII")
 UDP_HEADER = struct.Struct("!4sIIBH")
+ACK_SACK_WINDOW = 64
+ACK_SACK_FORMAT = struct.Struct("!IQ")
 MAX_UDP_PAYLOAD = UDP_MTU - 20 - 8 - UDP_HEADER.size
 
 
@@ -89,6 +105,15 @@ def validate_configuration() -> None:
         log.warning("SPOOF_IP still has a placeholder value: %s", SPOOF_IP)
     log.info("Configured UDP MTU=%s, max payload=%s bytes", UDP_MTU, MAX_UDP_PAYLOAD)
     log.info("Raw UDP will be sent with spoofed source=%s to destination=%s:%s", SPOOF_IP, VPS_IN_IP, UDP_PORT)
+    log.info(
+        "Retransmit scan=%ss max_resends_per_tick=%s max_pending_chunks=%s recv_size=%s socket_buffer=%s close_grace=%s",
+        RETRANSMIT_SCAN_INTERVAL,
+        MAX_RESENDS_PER_TICK,
+        MAX_PENDING_CHUNKS,
+        TARGET_RECV_SIZE,
+        SOCKET_BUFFER_BYTES,
+        SESSION_CLOSE_GRACE,
+    )
 
 
 def recv_exact(sock_obj: socket.socket, size: int) -> bytes:
@@ -134,11 +159,28 @@ def close_socket(sock_obj: socket.socket) -> None:
         pass
 
 
+def tune_tcp_socket(sock_obj: socket.socket) -> None:
+    try:
+        sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_BYTES)
+    except OSError:
+        pass
+    try:
+        sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_BYTES)
+    except OSError:
+        pass
+
+
 @dataclass
 class BufferedChunk:
     payload: bytes
     attempts: int = 1
     last_sent: float = field(default_factory=time.monotonic)
+    retry_interval: float = RESEND_INTERVAL
+    next_retry_at: float = field(default_factory=lambda: time.monotonic() + RESEND_INTERVAL)
 
 
 @dataclass
@@ -160,6 +202,8 @@ class SessionState:
     bytes_to_in: int = 0
     acks_received: int = 0
     last_ack_seq: int = -1
+    first_chunk_sent_at: Optional[float] = None
+    first_ack_received_at: Optional[float] = None
     tx_chunk_payload_limit: int = MAX_UDP_PAYLOAD
     send_buffer: dict[int, BufferedChunk] = field(default_factory=dict)
     control_error: str = ""
@@ -210,6 +254,13 @@ def unregister_session(session_id: int) -> None:
         sessions.pop(session_id, None)
 
 
+def first_ack_latency_ms(session: SessionState) -> Optional[int]:
+    if session.first_chunk_sent_at is None or session.first_ack_received_at is None:
+        return None
+    latency = int((session.first_ack_received_at - session.first_chunk_sent_at) * 1000)
+    return max(latency, 0)
+
+
 def close_session(session: SessionState, reason: str) -> None:
     with session.state_lock:
         if session.stop_event.is_set():
@@ -219,8 +270,9 @@ def close_session(session: SessionState, reason: str) -> None:
     unregister_session(session.session_id)
     with session_stats_lock:
         session_stats["last_close"] = reason
+    ack_latency = first_ack_latency_ms(session)
     log.info(
-        "session=%s closing reason=%s bytes_to_target=%s bytes_to_in=%s chunks_sent=%s acked_upto=%s acks_received=%s last_ack_seq=%s pending_chunks=%s",
+        "session=%s closing reason=%s bytes_to_target=%s bytes_to_in=%s chunks_sent=%s acked_upto=%s acks_received=%s last_ack_seq=%s pending_chunks=%s first_ack_latency_ms=%s",
         session.session_id,
         reason,
         session.bytes_to_target,
@@ -230,6 +282,7 @@ def close_session(session: SessionState, reason: str) -> None:
         session.acks_received,
         session.last_ack_seq,
         len(session.send_buffer),
+        ack_latency,
     )
     close_socket(session.control_sock)
     close_socket(session.target_sock)
@@ -244,11 +297,19 @@ def send_udp_chunk(session: SessionState, seq_num: int, payload: bytes, flags: i
 
 
 def send_chunk_with_tracking(session: SessionState, payload: bytes, flags: int = 0) -> None:
+    while not session.stop_event.is_set():
+        with session.state_lock:
+            if len(session.send_buffer) < MAX_PENDING_CHUNKS:
+                break
+        time.sleep(0.002)
+
     with session.state_lock:
         if session.stop_event.is_set():
             return
         seq_num = session.next_seq
         session.next_seq += 1
+        if session.first_chunk_sent_at is None:
+            session.first_chunk_sent_at = time.monotonic()
         session.send_buffer[seq_num] = BufferedChunk(payload=payload)
         session.chunks_sent += 1
     send_udp_chunk(session, seq_num, payload, flags=flags)
@@ -264,6 +325,16 @@ def send_control_error(session: SessionState, message: str) -> None:
         send_frame(session.control_sock, TYPE_ERROR, session.session_id, message.encode("utf-8", errors="replace"), session.send_lock)
     except Exception:
         pass
+
+
+def wait_for_pending_acks(session: SessionState, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while not session.stop_event.is_set() and time.monotonic() < deadline:
+        with session.state_lock:
+            pending = len(session.send_buffer)
+        if pending == 0:
+            return
+        time.sleep(0.02)
 
 
 def handle_control_reader(session: SessionState) -> None:
@@ -292,12 +363,42 @@ def handle_control_reader(session: SessionState) -> None:
                     with session.state_lock:
                         session.acks_received += 1
                         session.last_ack_seq = ack_seq
+                        if session.first_ack_received_at is None:
+                            session.first_ack_received_at = time.monotonic()
                         if ack_seq > session.acked_upto:
                             for seq_num in list(session.send_buffer.keys()):
                                 if seq_num <= ack_seq:
                                     session.send_buffer.pop(seq_num, None)
                             session.acked_upto = ack_seq
                     log.debug("session=%s acked upto seq=%s remaining=%s", session.session_id, ack_seq, len(session.send_buffer))
+                elif len(payload) == ACK_SACK_FORMAT.size:
+                    ack_base_raw, ack_mask = ACK_SACK_FORMAT.unpack(payload)
+                    ack_base = -1 if ack_base_raw == 0xFFFFFFFF else ack_base_raw
+                    removed = 0
+                    with session.state_lock:
+                        session.acks_received += 1
+                        session.last_ack_seq = ack_base
+                        if session.first_ack_received_at is None:
+                            session.first_ack_received_at = time.monotonic()
+                        if ack_base > session.acked_upto:
+                            session.acked_upto = ack_base
+                        for seq_num in list(session.send_buffer.keys()):
+                            if seq_num <= ack_base:
+                                session.send_buffer.pop(seq_num, None)
+                                removed += 1
+                                continue
+                            delta = seq_num - ack_base
+                            if 1 <= delta <= ACK_SACK_WINDOW and (ack_mask & (1 << (delta - 1))):
+                                session.send_buffer.pop(seq_num, None)
+                                removed += 1
+                    log.debug(
+                        "session=%s sack ack_base=%s ack_mask=0x%016x removed=%s remaining=%s",
+                        session.session_id,
+                        ack_base,
+                        ack_mask,
+                        removed,
+                        len(session.send_buffer),
+                    )
             elif message_type == TYPE_CLOSE:
                 close_session(session, "peer closed session")
                 return
@@ -315,10 +416,10 @@ def handle_control_reader(session: SessionState) -> None:
 def handle_target_reader(session: SessionState) -> None:
     try:
         while not session.stop_event.is_set():
-            data = session.target_sock.recv(8192)
+            data = session.target_sock.recv(TARGET_RECV_SIZE)
             if not data:
                 break
-            chunk_limit = max(256, session.tx_chunk_payload_limit)
+            chunk_limit = max(512, session.tx_chunk_payload_limit)
             for offset in range(0, len(data), chunk_limit):
                 chunk = data[offset : offset + chunk_limit]
                 send_chunk_with_tracking(session, chunk)
@@ -328,6 +429,7 @@ def handle_target_reader(session: SessionState) -> None:
             close_session(session, f"target read failed: {exc}")
     finally:
         if not session.stop_event.is_set():
+            wait_for_pending_acks(session, SESSION_CLOSE_GRACE)
             try:
                 send_control_error(session, "target closed connection")
                 send_frame(session.control_sock, TYPE_CLOSE, session.session_id, b"target closed", session.send_lock)
@@ -338,7 +440,7 @@ def handle_target_reader(session: SessionState) -> None:
 
 def handle_retransmissions(session: SessionState) -> None:
     while not session.stop_event.is_set():
-        time.sleep(0.25)
+        time.sleep(RETRANSMIT_SCAN_INTERVAL)
         if session.stop_event.is_set():
             break
 
@@ -349,8 +451,12 @@ def handle_retransmissions(session: SessionState) -> None:
                 if seq_num <= session.acked_upto:
                     session.send_buffer.pop(seq_num, None)
                     continue
-                if now - buffered.last_sent >= RESEND_INTERVAL:
+                if now >= buffered.next_retry_at:
                     resend_list.append((seq_num, buffered))
+
+        resend_list.sort(key=lambda item: item[0])
+        if len(resend_list) > MAX_RESENDS_PER_TICK:
+            resend_list = resend_list[:MAX_RESENDS_PER_TICK]
 
         for seq_num, buffered in resend_list:
             if session.stop_event.is_set():
@@ -360,7 +466,10 @@ def handle_retransmissions(session: SessionState) -> None:
                 if current is None:
                     continue
                 current.attempts += 1
-                current.last_sent = time.monotonic()
+                now = time.monotonic()
+                current.last_sent = now
+                current.retry_interval = min(current.retry_interval * RESEND_BACKOFF_FACTOR, 3.0)
+                current.next_retry_at = now + current.retry_interval
                 attempts = current.attempts
             if attempts > MAX_RETRIES:
                 close_session(session, f"retransmit limit reached for seq {seq_num}")
@@ -410,8 +519,14 @@ def log_status_loop() -> None:
         total_to_in = sum(session.bytes_to_in for session in snapshot)
         sessions_waiting_ack = sum(1 for session in snapshot if session.chunks_sent > 0 and session.acks_received == 0)
         pending_chunks = sum(len(session.send_buffer) for session in snapshot)
+        ack_latencies = []
+        for session in snapshot:
+            latency = first_ack_latency_ms(session)
+            if latency is not None:
+                ack_latencies.append(latency)
+        avg_first_ack_ms = int(sum(ack_latencies) / len(ack_latencies)) if ack_latencies else -1
         log.info(
-            "status active_sessions=%s accepted_sessions=%s total_chunks=%s bytes_to_target=%s bytes_to_in=%s sessions_waiting_ack=%s pending_chunks=%s",
+            "status active_sessions=%s accepted_sessions=%s total_chunks=%s bytes_to_target=%s bytes_to_in=%s sessions_waiting_ack=%s pending_chunks=%s avg_first_ack_ms=%s",
             len(snapshot),
             accepted,
             total_chunks,
@@ -419,6 +534,7 @@ def log_status_loop() -> None:
             total_to_in,
             sessions_waiting_ack,
             pending_chunks,
+            avg_first_ack_ms,
         )
 
 
@@ -426,6 +542,7 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
     session: Optional[SessionState] = None
     target_sock: Optional[socket.socket] = None
     try:
+        tune_tcp_socket(control_sock)
         control_sock.settimeout(TARGET_CONNECT_TIMEOUT)
         message_type, session_id, payload = recv_frame(control_sock)
         if message_type != TYPE_HELLO:
@@ -452,6 +569,7 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
             )
 
         target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tune_tcp_socket(target_sock)
         target_sock.settimeout(TARGET_CONNECT_TIMEOUT)
         target_sock.connect((target_host, target_port))
         target_sock.settimeout(None)
@@ -476,6 +594,7 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
                 "udp_mtu": UDP_MTU,
                 "max_udp_payload": MAX_UDP_PAYLOAD,
                 "negotiated_payload": negotiated_payload,
+                "ack_sack_window": ACK_SACK_WINDOW,
                 "spoof_ip": SPOOF_IP,
             },
         )

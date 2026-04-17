@@ -1,6 +1,6 @@
 # Hyper Tunnel
 
-This project is a proof-of-concept tunnel with two paths:
+This project is a custom tunnel with two paths:
 
 - TCP from VPS IN to VPS OUT goes through the local SOCKS5 proxy at `127.0.0.1:18001`
 - UDP from VPS OUT back to VPS IN uses spoofed source IP packets with an MTU budget of `1200`
@@ -63,3 +63,35 @@ On `in.py`:
 ## Notes
 
 The tunnel now uses framed control messages, session IDs, ACKs, and retransmits for UDP delivery. That makes failures visible in logs instead of silently mixing protocol bytes on one TCP stream.
+
+## Performance model
+
+- IN to OUT traffic uses framed TCP control messages (`TYPE_DATA`)
+- OUT to IN traffic uses UDP chunks with sequence numbers
+- IN sends cumulative ACK base plus a 64-bit selective ACK bitmap
+- OUT removes both cumulatively ACKed and selectively ACKed chunks from retransmit buffer
+
+This reduces unnecessary retransmissions when packets arrive out of order.
+
+## Recommended production tuning
+
+In `out_config.json`:
+
+- `resend_interval`: start at `0.30` to `0.40`
+- `retransmit_scan_interval`: `0.05`
+- `max_resends_per_tick`: `64` (raise to `96` for high RTT/loss)
+- `max_pending_chunks`: `8192` (raise if memory is sufficient)
+- `socket_buffer_bytes`: `4194304`
+
+In `in_config.json`:
+
+- `udp_recv_buffer_bytes`: `4194304`
+- `socket_buffer_bytes`: `4194304`
+- `client_recv_size`: `65536`
+
+After changes, restart both endpoints and monitor:
+
+- OUT status: `sessions_waiting_ack`, `pending_chunks`, `avg_first_ack_ms`
+- OUT close lines: `acks_received`, `pending_chunks`, `first_ack_latency_ms`
+
+If `pending_chunks` keeps growing while `acks_received` stays low, the path is still ACK-starved and needs either lower MTU, faster ACK return path, or architecture change.

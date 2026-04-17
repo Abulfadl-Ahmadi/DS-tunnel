@@ -31,6 +31,9 @@ DEFAULT_CONFIG = {
     "socks5_listen_host": "127.0.0.1",
     "socks5_listen_port": 10808,
     "udp_mtu": 1200,
+    "udp_recv_buffer_bytes": 1048576,
+    "socket_buffer_bytes": 1048576,
+    "client_recv_size": 65536,
     "keepalive_interval": 3.0,
     "keepalive_timeout": 10.0,
     "control_timeout": 15.0,
@@ -63,6 +66,9 @@ UDP_LISTEN_PORT = int(CONFIG["udp_listen_port"])
 SOCKS5_LISTEN_HOST = str(CONFIG["socks5_listen_host"])
 SOCKS5_LISTEN_PORT = int(CONFIG["socks5_listen_port"])
 UDP_MTU = int(CONFIG["udp_mtu"])
+UDP_RECV_BUFFER_BYTES = int(CONFIG["udp_recv_buffer_bytes"])
+SOCKET_BUFFER_BYTES = int(CONFIG["socket_buffer_bytes"])
+CLIENT_RECV_SIZE = int(CONFIG["client_recv_size"])
 KEEPALIVE_INTERVAL = float(CONFIG["keepalive_interval"])
 KEEPALIVE_TIMEOUT = float(CONFIG["keepalive_timeout"])
 CONTROL_TIMEOUT = float(CONFIG["control_timeout"])
@@ -84,6 +90,8 @@ TYPE_ERROR = 8
 
 TCP_HEADER = struct.Struct("!4sBBII")
 UDP_HEADER = struct.Struct("!4sIIBH")
+ACK_SACK_WINDOW = 64
+ACK_SACK_FORMAT = struct.Struct("!IQ")
 
 
 def validate_configuration() -> None:
@@ -92,6 +100,12 @@ def validate_configuration() -> None:
     if SOCKS5_PROXY[0] == "127.0.0.1" and SOCKS5_PROXY[1] == 18001:
         log.info("Using local SOCKS5 proxy at %s:%s", SOCKS5_PROXY[0], SOCKS5_PROXY[1])
     log.info("Configured UDP MTU=%s, max payload=%s bytes", UDP_MTU, MAX_UDP_PAYLOAD)
+    log.info(
+        "Configured buffers udp_recv=%s socket_buffer=%s client_recv=%s",
+        UDP_RECV_BUFFER_BYTES,
+        SOCKET_BUFFER_BYTES,
+        CLIENT_RECV_SIZE,
+    )
 
 
 def recv_exact(sock_obj: socket.socket, size: int) -> bytes:
@@ -126,6 +140,21 @@ def send_frame(sock_obj: socket.socket, message_type: int, session_id: int, payl
 
 def send_socks5_reply(client_sock: socket.socket, reply_code: int) -> None:
     client_sock.sendall(b"\x05" + bytes([reply_code]) + b"\x00\x01\x00\x00\x00\x00\x00\x00")
+
+
+def tune_tcp_socket(sock_obj: socket.socket) -> None:
+    try:
+        sock_obj.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_BYTES)
+    except OSError:
+        pass
+    try:
+        sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_BYTES)
+    except OSError:
+        pass
 
 
 def parse_socks5_request(client_sock: socket.socket) -> tuple[int, str, int]:
@@ -293,11 +322,12 @@ def close_session(session: SessionState, reason: str) -> None:
 def udp_receiver() -> None:
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_BYTES)
     udp_sock.bind(("0.0.0.0", UDP_LISTEN_PORT))
     log.info("UDP receiver listening on %s", UDP_LISTEN_PORT)
 
     while True:
-        data, addr = udp_sock.recvfrom(2048)
+        data, addr = udp_sock.recvfrom(UDP_MTU + 128)
         if len(data) < UDP_HEADER.size:
             log.warning("dropped short UDP packet from %s len=%s", addr, len(data))
             continue
@@ -328,13 +358,20 @@ def udp_receiver() -> None:
             log.debug("dropping UDP packet for unknown session=%s from %s", session_id, addr)
             continue
 
+        ack_base = -1
+        ack_mask = 0
+        should_ack = False
         with session.state_lock:
             if session.stop_event.is_set():
                 continue
             log.debug("session=%s UDP source=%s seq=%s flags=%s", session_id, addr[0], seq_num, flags)
             if seq_num < session.next_udp_seq:
-                continue
-            session.pending_udp[seq_num] = payload
+                ack_base = session.highest_delivered_seq
+                should_ack = True
+            else:
+                if seq_num not in session.pending_udp:
+                    session.pending_udp[seq_num] = payload
+                    should_ack = True
 
             delivered = False
             while session.next_udp_seq in session.pending_udp:
@@ -350,16 +387,28 @@ def udp_receiver() -> None:
                 session.next_udp_seq += 1
                 delivered = True
 
-        if delivered and not session.stop_event.is_set():
+            if delivered:
+                should_ack = True
+
+            ack_base = session.highest_delivered_seq
+            for pending_seq in session.pending_udp.keys():
+                delta = pending_seq - ack_base
+                if 1 <= delta <= ACK_SACK_WINDOW:
+                    ack_mask |= 1 << (delta - 1)
+
+        if should_ack and not session.stop_event.is_set():
             try:
-                send_frame(session.control_sock, TYPE_ACK, session.session_id, struct.pack("!I", session.highest_delivered_seq), session.send_lock)
+                ack_base_raw = 0xFFFFFFFF if ack_base < 0 else ack_base
+                payload = ACK_SACK_FORMAT.pack(ack_base_raw, ack_mask)
+                send_frame(session.control_sock, TYPE_ACK, session.session_id, payload, session.send_lock)
                 with session.state_lock:
                     session.acks_sent += 1
-                    session.last_acked_seq = session.highest_delivered_seq
+                    session.last_acked_seq = ack_base
                 log.debug(
-                    "session=%s acked seq=%s bytes_from_out=%s chunks=%s",
+                    "session=%s acked seq=%s mask=0x%016x bytes_from_out=%s chunks=%s",
                     session.session_id,
-                    session.highest_delivered_seq,
+                    ack_base,
+                    ack_mask,
                     session.bytes_from_out,
                     session.chunks_from_out,
                 )
@@ -371,6 +420,7 @@ def udp_receiver() -> None:
 
 def connect_control_channel(target_host: str, target_port: int, client_addr: tuple[str, int]) -> socket.socket:
     control_sock = socks.socksocket()
+    tune_tcp_socket(control_sock)
     control_sock.set_proxy(socks.SOCKS5, SOCKS5_PROXY[0], SOCKS5_PROXY[1])
     control_sock.settimeout(SOCKS5_CONNECT_TIMEOUT)
     control_sock.connect((VPS_OUT_IP, VPS_OUT_CONTROL_PORT))
@@ -429,7 +479,7 @@ def handle_control_reader(session: SessionState) -> None:
 def handle_client_to_out(session: SessionState) -> None:
     try:
         while not session.stop_event.is_set():
-            data = session.client_sock.recv(8192)
+            data = session.client_sock.recv(CLIENT_RECV_SIZE)
             if not data:
                 break
             session.bytes_from_client += len(data)
@@ -488,6 +538,7 @@ def handle_socks5_client(client_sock: socket.socket, client_addr: tuple[str, int
             target_host=target_host,
             target_port=target_port,
         )
+        tune_tcp_socket(client_sock)
         register_session(session)
 
         hello_payload = json.dumps(
@@ -498,6 +549,7 @@ def handle_socks5_client(client_sock: socket.socket, client_addr: tuple[str, int
                 "udp_listen_port": UDP_LISTEN_PORT,
                 "udp_mtu": UDP_MTU,
                 "max_udp_payload": MAX_UDP_PAYLOAD,
+                "ack_sack_window": ACK_SACK_WINDOW,
             },
             separators=(",", ":"),
         ).encode("utf-8")
