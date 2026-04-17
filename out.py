@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "max_pending_chunks": 8192,
     "target_recv_size": 65536,
     "socket_buffer_bytes": 1048576,
+    "udp_plain_fallback_enabled": True,
     "log_file": "log_out_runtime.log",
     "log_level": "INFO",
     "log_max_bytes": 20971520,
@@ -62,6 +63,18 @@ def load_config() -> dict[str, object]:
     else:
         log.info("config file %s not found, using built-in defaults", CONFIG_PATH)
     return config
+
+
+def parse_bool(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if value is None:
+        return default
+    return bool(value)
 
 
 def configure_logging(config: dict[str, object]) -> Path:
@@ -113,6 +126,7 @@ RESEND_BACKOFF_FACTOR = float(CONFIG["resend_backoff_factor"])
 MAX_PENDING_CHUNKS = int(CONFIG["max_pending_chunks"])
 TARGET_RECV_SIZE = int(CONFIG["target_recv_size"])
 SOCKET_BUFFER_BYTES = int(CONFIG["socket_buffer_bytes"])
+UDP_PLAIN_FALLBACK_ENABLED = parse_bool(CONFIG.get("udp_plain_fallback_enabled", True), True)
 SESSION_CLOSE_GRACE = float(CONFIG["session_close_grace"])
 KEEPALIVE_INTERVAL = float(CONFIG["keepalive_interval"])
 KEEPALIVE_TIMEOUT = float(CONFIG["keepalive_timeout"])
@@ -146,13 +160,14 @@ def validate_configuration() -> None:
     log.info("Configured UDP MTU=%s, max payload=%s bytes", UDP_MTU, MAX_UDP_PAYLOAD)
     log.info("Raw UDP will be sent with spoofed source=%s to destination=%s:%s", SPOOF_IP, VPS_IN_IP, UDP_PORT)
     log.info(
-        "Retransmit scan=%ss max_resends_per_tick=%s max_pending_chunks=%s recv_size=%s socket_buffer=%s close_grace=%s",
+        "Retransmit scan=%ss max_resends_per_tick=%s max_pending_chunks=%s recv_size=%s socket_buffer=%s close_grace=%s udp_plain_fallback=%s",
         RETRANSMIT_SCAN_INTERVAL,
         MAX_RESENDS_PER_TICK,
         MAX_PENDING_CHUNKS,
         TARGET_RECV_SIZE,
         SOCKET_BUFFER_BYTES,
         SESSION_CLOSE_GRACE,
+        UDP_PLAIN_FALLBACK_ENABLED,
     )
     log.info("Runtime logs are being written to %s", LOG_FILE_PATH)
 
@@ -213,6 +228,24 @@ def tune_tcp_socket(sock_obj: socket.socket) -> None:
         sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFFER_BYTES)
     except OSError:
         pass
+
+
+_udp_plain_sock_lock = threading.Lock()
+_udp_plain_sock: Optional[socket.socket] = None
+
+
+def get_udp_plain_sock() -> socket.socket:
+    global _udp_plain_sock
+    with _udp_plain_sock_lock:
+        if _udp_plain_sock is not None:
+            return _udp_plain_sock
+        sock_obj = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock_obj.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUFFER_BYTES)
+        except OSError:
+            pass
+        _udp_plain_sock = sock_obj
+        return sock_obj
 
 
 @dataclass
@@ -332,9 +365,30 @@ def close_session(session: SessionState, reason: str) -> None:
 
 def send_udp_chunk(session: SessionState, seq_num: int, payload: bytes, flags: int = 0) -> None:
     packet = UDP_HEADER.pack(MAGIC, session.session_id, seq_num, flags, len(payload)) + payload
-    ip_layer = IP(src=SPOOF_IP, dst=VPS_IN_IP)
-    udp_layer = UDP(sport=UDP_PORT, dport=UDP_PORT)
-    send(ip_layer / udp_layer / packet, verbose=False)
+    sent_any = False
+    spoof_error: Optional[Exception] = None
+
+    try:
+        ip_layer = IP(src=SPOOF_IP, dst=VPS_IN_IP)
+        udp_layer = UDP(sport=UDP_PORT, dport=UDP_PORT)
+        send(ip_layer / udp_layer / packet, verbose=False)
+        sent_any = True
+    except Exception as exc:
+        spoof_error = exc
+
+    if UDP_PLAIN_FALLBACK_ENABLED:
+        try:
+            plain_sock = get_udp_plain_sock()
+            plain_sock.sendto(packet, (VPS_IN_IP, UDP_PORT))
+            sent_any = True
+        except Exception as exc:
+            if spoof_error is None:
+                spoof_error = exc
+
+    if not sent_any:
+        if spoof_error is None:
+            raise RuntimeError("failed to send UDP chunk")
+        raise RuntimeError(f"failed to send UDP chunk: {spoof_error}")
 
 
 def send_chunk_with_tracking(session: SessionState, payload: bytes, flags: int = 0) -> None:

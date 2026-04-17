@@ -1,6 +1,6 @@
 {
   "vps_in_ip": "194.59.215.198",
-  "spoof_ip": "5.34.13.40",
+  "spoof_ip": "37.32.22.113",
   "udp_port": 10808,
   "control_port": 8888,
   "listen_host": "0.0.0.0",
@@ -12,6 +12,7 @@
   "max_pending_chunks": 8192,
   "target_recv_size": 65536,
   "socket_buffer_bytes": 4194304,
+  "udp_plain_fallback_enabled": true,
   "log_file": "log_out_runtime.log",
   "log_level": "INFO",
   "log_max_bytes": 20971520,
