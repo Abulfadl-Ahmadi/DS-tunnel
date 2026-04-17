@@ -82,6 +82,15 @@ UDP_HEADER = struct.Struct("!4sIIBH")
 MAX_UDP_PAYLOAD = UDP_MTU - 20 - 8 - UDP_HEADER.size
 
 
+def validate_configuration() -> None:
+    if VPS_IN_IP in {"1.2.3.4", "5.6.7.8"}:
+        log.warning("VPS_IN_IP still has a placeholder value: %s", VPS_IN_IP)
+    if SPOOF_IP in {"1.2.3.4", "5.6.7.8"}:
+        log.warning("SPOOF_IP still has a placeholder value: %s", SPOOF_IP)
+    log.info("Configured UDP MTU=%s, max payload=%s bytes", UDP_MTU, MAX_UDP_PAYLOAD)
+    log.info("Raw UDP will be sent with spoofed source=%s to destination=%s:%s", SPOOF_IP, VPS_IN_IP, UDP_PORT)
+
+
 def recv_exact(sock_obj: socket.socket, size: int) -> bytes:
     data = bytearray()
     while len(data) < size:
