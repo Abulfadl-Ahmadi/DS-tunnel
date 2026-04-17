@@ -1,0 +1,15 @@
+{
+  "socks5_proxy_host": "127.0.0.1",
+  "socks5_proxy_port": 18001,
+  "vps_out_ip": "5.6.7.8",
+  "vps_out_control_port": 8888,
+  "udp_listen_port": 10808,
+  "socks5_listen_host": "127.0.0.1",
+  "socks5_listen_port": 10808,
+  "udp_mtu": 1200,
+  "keepalive_interval": 3.0,
+  "keepalive_timeout": 10.0,
+  "control_timeout": 15.0,
+  "socks5_connect_timeout": 10.0,
+  "session_close_grace": 1.0
+}
