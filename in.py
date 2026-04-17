@@ -128,7 +128,7 @@ def send_socks5_reply(client_sock: socket.socket, reply_code: int) -> None:
     client_sock.sendall(b"\x05" + bytes([reply_code]) + b"\x00\x01\x00\x00\x00\x00\x00\x00")
 
 
-def parse_socks5_request(client_sock: socket.socket) -> tuple[str, int]:
+def parse_socks5_request(client_sock: socket.socket) -> tuple[int, str, int]:
     first = recv_exact(client_sock, 2)
     version, method_count = first[0], first[1]
     if version != 5:
@@ -142,7 +142,7 @@ def parse_socks5_request(client_sock: socket.socket) -> tuple[str, int]:
     version, command, _reserved, address_type = request
     if version != 5:
         raise ValueError(f"unexpected SOCKS request version {version}")
-    if command != 1:
+    if command not in {1, 3}:
         raise ValueError(f"unsupported SOCKS command {command}")
 
     if address_type == 1:
@@ -156,7 +156,7 @@ def parse_socks5_request(client_sock: socket.socket) -> tuple[str, int]:
         raise ValueError(f"unsupported SOCKS address type {address_type}")
 
     port = struct.unpack("!H", recv_exact(client_sock, 2))[0]
-    return host, port
+    return command, host, port
 
 
 @dataclass
@@ -397,7 +397,11 @@ def handle_keepalive(session: SessionState) -> None:
 def handle_socks5_client(client_sock: socket.socket, client_addr: tuple[str, int]) -> None:
     session: Optional[SessionState] = None
     try:
-        target_host, target_port = parse_socks5_request(client_sock)
+        command, target_host, target_port = parse_socks5_request(client_sock)
+        if command == 3:
+            log.warning("client=%s requested UDP ASSOCIATE for %s:%s; not supported", client_addr, target_host, target_port)
+            send_socks5_reply(client_sock, 7)
+            return
         session_id = secrets.randbits(32)
         log.info("session=%s client=%s target=%s:%s", session_id, client_addr, target_host, target_port)
 

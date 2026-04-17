@@ -58,6 +58,7 @@ On `in.py`:
 - `out.py` does not have permission to send raw packets
 - Firewalls or security groups block TCP `8888` or UDP `10808`
 - The target path is lossy enough that retransmits hit the retry limit
+- SOCKS5 UDP ASSOCIATE is currently rejected by `in.py`; disable UDP/QUIC in the client or add UDP support before expecting DNS-over-UDP to work
 
 ## Notes
 
