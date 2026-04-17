@@ -1,6 +1,6 @@
 {
-  "vps_in_ip": "194.59.215.198",
-  "spoof_ip": "37.32.22.113",
+  "vps_in_ip": "LOAD_FROM_ENV",
+  "spoof_ip": "LOAD_FROM_ENV",
   "udp_port": 10808,
   "control_port": 8888,
   "listen_host": "0.0.0.0",

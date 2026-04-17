@@ -8,6 +8,8 @@ import socket
 import struct
 import threading
 import time
+import os
+from dotenv import load_dotenv
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -62,6 +64,17 @@ def load_config() -> dict[str, object]:
             log.warning("failed to load %s: %s", CONFIG_PATH, exc)
     else:
         log.info("config file %s not found, using built-in defaults", CONFIG_PATH)
+    
+    # Override IPs from environment variables
+    env_file = Path(__file__).parent / ".env"
+    if env_file.exists():
+        load_dotenv(env_file)
+    
+    config["vps_in_ip"] = os.getenv("VPS_IN_IP", config.get("vps_in_ip", "1.2.3.4"))
+    config["spoof_ip"] = os.getenv("SPOOF_IP", config.get("spoof_ip", "5.6.7.8"))
+    
+    return config
+    
     return config
 
 
