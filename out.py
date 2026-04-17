@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import socket
 import struct
 import threading
@@ -35,6 +36,10 @@ DEFAULT_CONFIG = {
     "max_pending_chunks": 8192,
     "target_recv_size": 65536,
     "socket_buffer_bytes": 1048576,
+    "log_file": "log_out_runtime.log",
+    "log_level": "INFO",
+    "log_max_bytes": 20971520,
+    "log_backup_count": 5,
     "session_close_grace": 0.8,
     "keepalive_interval": 3.0,
     "keepalive_timeout": 10.0,
@@ -59,7 +64,42 @@ def load_config() -> dict[str, object]:
     return config
 
 
+def configure_logging(config: dict[str, object]) -> Path:
+    log_level_name = str(config.get("log_level", "INFO")).upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    log_file_raw = str(config.get("log_file", "log_out_runtime.log"))
+    log_file = Path(log_file_raw)
+    if not log_file.is_absolute():
+        log_file = Path(__file__).with_name(log_file_raw)
+
+    log_max_bytes = int(config.get("log_max_bytes", 20 * 1024 * 1024))
+    log_backup_count = int(config.get("log_backup_count", 5))
+    formatter = logging.Formatter("%(asctime)s [OUT] %(message)s")
+
+    handlers: list[logging.Handler] = []
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    handlers.append(stream_handler)
+
+    try:
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=log_max_bytes,
+            backupCount=log_backup_count,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("failed to initialize file logging at %s: %s", log_file, exc)
+
+    logging.basicConfig(level=log_level, handlers=handlers, force=True)
+    return log_file
+
+
 CONFIG = load_config()
+LOG_FILE_PATH = configure_logging(CONFIG)
+log = logging.getLogger(__name__)
 VPS_IN_IP = str(CONFIG["vps_in_ip"])
 SPOOF_IP = str(CONFIG["spoof_ip"])
 UDP_PORT = int(CONFIG["udp_port"])
@@ -114,6 +154,7 @@ def validate_configuration() -> None:
         SOCKET_BUFFER_BYTES,
         SESSION_CLOSE_GRACE,
     )
+    log.info("Runtime logs are being written to %s", LOG_FILE_PATH)
 
 
 def recv_exact(sock_obj: socket.socket, size: int) -> bytes:
