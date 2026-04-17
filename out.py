@@ -164,11 +164,18 @@ class SessionState:
 
 sessions: dict[int, SessionState] = {}
 sessions_lock = threading.Lock()
+session_stats_lock = threading.Lock()
+session_stats = {
+    "accepted": 0,
+    "last_close": "",
+}
 
 
 def register_session(session: SessionState) -> None:
     with sessions_lock:
         sessions[session.session_id] = session
+    with session_stats_lock:
+        session_stats["accepted"] += 1
 
 
 def unregister_session(session_id: int) -> None:
@@ -183,6 +190,8 @@ def close_session(session: SessionState, reason: str) -> None:
         session.stop_event.set()
         session.control_error = reason
     unregister_session(session.session_id)
+    with session_stats_lock:
+        session_stats["last_close"] = reason
     log.info(
         "session=%s closing reason=%s bytes_to_target=%s bytes_to_in=%s chunks_sent=%s acked_upto=%s",
         session.session_id,
@@ -350,15 +359,25 @@ def log_status_loop() -> None:
         time.sleep(15.0)
         with sessions_lock:
             snapshot = list(sessions.values())
+        with session_stats_lock:
+            accepted = session_stats["accepted"]
+            last_close = session_stats["last_close"]
         if not snapshot:
-            log.info("status active_sessions=0")
+            if last_close:
+                log.info("status active_sessions=0 accepted_sessions=%s last_close=%s", accepted, last_close)
+            else:
+                log.info(
+                    "status active_sessions=0 accepted_sessions=%s waiting_for_in_connection=1",
+                    accepted,
+                )
             continue
         total_chunks = sum(session.chunks_sent for session in snapshot)
         total_to_target = sum(session.bytes_to_target for session in snapshot)
         total_to_in = sum(session.bytes_to_in for session in snapshot)
         log.info(
-            "status active_sessions=%s total_chunks=%s bytes_to_target=%s bytes_to_in=%s",
+            "status active_sessions=%s accepted_sessions=%s total_chunks=%s bytes_to_target=%s bytes_to_in=%s",
             len(snapshot),
+            accepted,
             total_chunks,
             total_to_target,
             total_to_in,
