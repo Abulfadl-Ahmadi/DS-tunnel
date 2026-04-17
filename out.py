@@ -160,6 +160,7 @@ class SessionState:
     bytes_to_in: int = 0
     acks_received: int = 0
     last_ack_seq: int = -1
+    tx_chunk_payload_limit: int = MAX_UDP_PAYLOAD
     send_buffer: dict[int, BufferedChunk] = field(default_factory=dict)
     control_error: str = ""
 
@@ -317,8 +318,9 @@ def handle_target_reader(session: SessionState) -> None:
             data = session.target_sock.recv(8192)
             if not data:
                 break
-            for offset in range(0, len(data), MAX_UDP_PAYLOAD):
-                chunk = data[offset : offset + MAX_UDP_PAYLOAD]
+            chunk_limit = max(256, session.tx_chunk_payload_limit)
+            for offset in range(0, len(data), chunk_limit):
+                chunk = data[offset : offset + chunk_limit]
                 send_chunk_with_tracking(session, chunk)
                 session.bytes_to_in += len(chunk)
     except Exception as exc:
@@ -432,7 +434,22 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
         hello = json.loads(payload.decode("utf-8"))
         target_host = str(hello["target_host"])
         target_port = int(hello["target_port"])
+        in_advertised_mtu = int(hello.get("udp_mtu", UDP_MTU))
+        in_advertised_max_payload = int(hello.get("max_udp_payload", MAX_UDP_PAYLOAD))
+        negotiated_payload = min(MAX_UDP_PAYLOAD, in_advertised_max_payload)
+        if negotiated_payload < 256:
+            raise ValueError(
+                f"invalid negotiated payload size {negotiated_payload} (in_advertised_max_payload={in_advertised_max_payload})"
+            )
         log.info("session=%s client=%s target=%s:%s", session_id, client_addr, target_host, target_port)
+        if in_advertised_mtu != UDP_MTU:
+            log.warning(
+                "session=%s MTU mismatch IN=%s OUT=%s negotiated_payload=%s",
+                session_id,
+                in_advertised_mtu,
+                UDP_MTU,
+                negotiated_payload,
+            )
 
         target_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         target_sock.settimeout(TARGET_CONNECT_TIMEOUT)
@@ -446,6 +463,7 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
             client_addr=client_addr,
             target_host=target_host,
             target_port=target_port,
+            tx_chunk_payload_limit=negotiated_payload,
         )
         register_session(session)
 
@@ -457,6 +475,7 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
                 "target_port": target_port,
                 "udp_mtu": UDP_MTU,
                 "max_udp_payload": MAX_UDP_PAYLOAD,
+                "negotiated_payload": negotiated_payload,
                 "spoof_ip": SPOOF_IP,
             },
         )
