@@ -73,6 +73,27 @@ The tunnel now uses framed control messages, session IDs, ACKs, and retransmits 
 
 This reduces unnecessary retransmissions when packets arrive out of order.
 
+## Downstream acceleration with Go sender
+
+`out.py` can now use a Go-based downstream sender from `spoof-tunnel` to emit spoofed UDP packets faster than Scapy.
+
+- Upstream is unchanged and still goes through SOCKS5 `127.0.0.1:18001`
+- Only OUT -> IN UDP downstream send path is switched to Go
+- If Go build/start fails, `out.py` automatically falls back to the previous Python send path
+
+New `out_config.json` keys:
+
+- `go_downstream_sender_enabled` (default `true`)
+- `go_sender_project_dir` (default `spoof-tunnel`)
+- `go_sender_build_dir` (default `.go-bin`)
+- `go_sender_binary_name` (default `downstream-sender`)
+- `go_sender_send_only` (default `true`)
+
+Requirements for acceleration on VPS OUT:
+
+- Go toolchain installed (`go` in `PATH`)
+- Raw packet permission (root or equivalent capabilities)
+
 ## Recommended production tuning
 
 In `out_config.json`:

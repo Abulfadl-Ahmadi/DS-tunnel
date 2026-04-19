@@ -6,6 +6,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 import socket
 import struct
+import subprocess
+import shutil
+import atexit
 import threading
 import time
 import os
@@ -48,6 +51,11 @@ DEFAULT_CONFIG = {
     "keepalive_timeout": 10.0,
     "max_retries": 5,
     "target_connect_timeout": 10.0,
+    "go_downstream_sender_enabled": True,
+    "go_sender_project_dir": "spoof-tunnel",
+    "go_sender_build_dir": ".go-bin",
+    "go_sender_binary_name": "downstream-sender",
+    "go_sender_send_only": True,
 }
 
 
@@ -145,6 +153,11 @@ KEEPALIVE_INTERVAL = float(CONFIG["keepalive_interval"])
 KEEPALIVE_TIMEOUT = float(CONFIG["keepalive_timeout"])
 MAX_RETRIES = int(CONFIG["max_retries"])
 TARGET_CONNECT_TIMEOUT = float(CONFIG["target_connect_timeout"])
+GO_DOWNSTREAM_SENDER_ENABLED = parse_bool(CONFIG.get("go_downstream_sender_enabled", True), True)
+GO_SENDER_PROJECT_DIR = str(CONFIG.get("go_sender_project_dir", "spoof-tunnel"))
+GO_SENDER_BUILD_DIR = str(CONFIG.get("go_sender_build_dir", ".go-bin"))
+GO_SENDER_BINARY_NAME = str(CONFIG.get("go_sender_binary_name", "downstream-sender"))
+GO_SENDER_SEND_ONLY = parse_bool(CONFIG.get("go_sender_send_only", True), True)
 
 MAGIC = b"HTUN"
 VERSION = 1
@@ -245,6 +258,136 @@ def tune_tcp_socket(sock_obj: socket.socket) -> None:
 
 _udp_plain_sock_lock = threading.Lock()
 _udp_plain_sock: Optional[socket.socket] = None
+
+
+class GoDownstreamSender:
+    def __init__(self, process: subprocess.Popen[bytes], binary_path: Path) -> None:
+        self.process = process
+        self.binary_path = binary_path
+        self._lock = threading.Lock()
+
+    def send(self, payload: bytes) -> None:
+        if self.process.stdin is None:
+            raise RuntimeError("go sender stdin is unavailable")
+        frame = struct.pack("!I", len(payload)) + payload
+        with self._lock:
+            if self.process.poll() is not None:
+                raise RuntimeError(f"go sender exited with code {self.process.returncode}")
+            self.process.stdin.write(frame)
+            self.process.stdin.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            proc = self.process
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except Exception:
+                    proc.kill()
+
+
+go_sender_lock = threading.Lock()
+go_sender: Optional[GoDownstreamSender] = None
+
+
+def build_go_sender_binary() -> Optional[Path]:
+    if not GO_DOWNSTREAM_SENDER_ENABLED:
+        return None
+    go_cmd = shutil.which("go")
+    if go_cmd is None:
+        log.warning("go is not installed; downstream sender disabled, using Python send path")
+        return None
+
+    project_dir = Path(__file__).parent / GO_SENDER_PROJECT_DIR
+    sender_cmd_dir = project_dir / "cmd" / "downstream-sender"
+    if not sender_cmd_dir.exists():
+        log.warning("go sender source not found at %s; using Python send path", sender_cmd_dir)
+        return None
+
+    build_dir = Path(__file__).parent / GO_SENDER_BUILD_DIR
+    build_dir.mkdir(parents=True, exist_ok=True)
+    binary_path = build_dir / GO_SENDER_BINARY_NAME
+
+    build_cmd = [
+        go_cmd,
+        "build",
+        "-o",
+        str(binary_path),
+        "./cmd/downstream-sender",
+    ]
+
+    try:
+        completed = subprocess.run(
+            build_cmd,
+            cwd=project_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        if completed.stderr.strip():
+            log.debug("go build stderr: %s", completed.stderr.strip())
+    except Exception as exc:
+        log.warning("failed to build go downstream sender (%s); using Python send path", exc)
+        return None
+
+    return binary_path
+
+
+def init_go_sender() -> None:
+    global go_sender
+    if not GO_DOWNSTREAM_SENDER_ENABLED:
+        return
+
+    binary_path = build_go_sender_binary()
+    if binary_path is None:
+        return
+
+    command = [
+        str(binary_path),
+        "-source-ip",
+        SPOOF_IP,
+        "-dest-ip",
+        VPS_IN_IP,
+        "-dest-port",
+        str(UDP_PORT),
+        "-listen-port",
+        str(UDP_PORT),
+        "-buffer-size",
+        str(SOCKET_BUFFER_BYTES),
+    ]
+
+    try:
+        proc: subprocess.Popen[bytes] = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd=binary_path.parent,
+        )
+        go_sender = GoDownstreamSender(proc, binary_path)
+        log.info("go downstream sender enabled: %s", binary_path)
+    except Exception as exc:
+        log.warning("failed to start go downstream sender (%s); using Python send path", exc)
+        go_sender = None
+
+
+def disable_go_sender(reason: str) -> None:
+    global go_sender
+    with go_sender_lock:
+        if go_sender is None:
+            return
+        log.warning("disabling go downstream sender: %s", reason)
+        go_sender.close()
+        go_sender = None
+
+
+atexit.register(lambda: disable_go_sender("process exit"))
 
 
 def get_udp_plain_sock() -> socket.socket:
@@ -378,6 +521,16 @@ def close_session(session: SessionState, reason: str) -> None:
 
 def send_udp_chunk(session: SessionState, seq_num: int, payload: bytes, flags: int = 0) -> None:
     packet = UDP_HEADER.pack(MAGIC, session.session_id, seq_num, flags, len(payload)) + payload
+    if GO_SENDER_SEND_ONLY:
+        with go_sender_lock:
+            active_sender = go_sender
+        if active_sender is not None:
+            try:
+                active_sender.send(packet)
+                return
+            except Exception as exc:
+                disable_go_sender(f"go sender send failed: {exc}")
+
     sent_any = False
     spoof_error: Optional[Exception] = None
 
@@ -735,6 +888,7 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
 
 def main() -> None:
     validate_configuration()
+    init_go_sender()
     threading.Thread(target=log_status_loop, daemon=True).start()
 
     listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
