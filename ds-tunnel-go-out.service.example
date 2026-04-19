@@ -1,0 +1,16 @@
+[Unit]
+Description=DS Tunnel Go Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/DS-tunnel/spoof-tunnel
+ExecStart=/root/DS-tunnel/spoof-tunnel/spoof -c /root/DS-tunnel/spoof-tunnel/server-config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+User=root
+
+[Install]
+WantedBy=multi-user.target

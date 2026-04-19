@@ -26,5 +26,7 @@
   "go_sender_project_dir": "spoof-tunnel",
   "go_sender_build_dir": ".go-bin",
   "go_sender_binary_name": "downstream-sender",
-  "go_sender_send_only": true
+  "go_sender_send_only": true,
+  "go_downstream_sender_required": true,
+  "go_binary_path": "/usr/local/go/bin/go"
 }

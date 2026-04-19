@@ -7,58 +7,61 @@ This project is a custom tunnel with two paths:
 
 ## Files
 
-- `in.py` runs on VPS IN
-- `out.py` runs on VPS OUT
+- `spoof-tunnel/cmd/spoof` is the Go binary for both VPS IN and VPS OUT
+- `in.py` and `out.py` are legacy Python endpoints and are no longer the recommended runtime path
 
 ## Dependencies
 
-Install the Python packages listed in `requirements.txt`.
+Build and run the Go binary from `spoof-tunnel`.
 
 ```bash
-pip install -r requirements.txt
+cd spoof-tunnel
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o spoof ./cmd/spoof/
 ```
 
-`out.py` also needs permission to send raw spoofed packets. On Linux this usually means running as root or granting the Python interpreter the required capabilities.
+`spoof` needs permission to send raw spoofed packets. On Linux this usually means running as root or granting the binary `CAP_NET_RAW`.
 
 ## Configuration
 
-Update these placeholders before running:
+Use these config files instead:
 
-- `in.py`: `VPS_OUT_IP`
-- `out.py`: `VPS_IN_IP`
-- `out.py`: `SPOOF_IP`
+- `spoof-tunnel/client-config.json`
+- `spoof-tunnel/server-config.json`
 
-The local SOCKS5 proxy on VPS IN must be reachable at `127.0.0.1:18001`.
+Set `server.address` on the client to the VPS OUT public IP.
+Set `spoof.source_ip` on each side to the spoofed source IP you want that side to emit.
+Set `spoof.peer_spoof_ip` on each side to the spoofed IP expected from the peer.
+
+The local SOCKS5 proxy on VPS IN must be reachable at `127.0.0.1:18001` if you use the current IN-side SOCKS5 setup.
 
 ## Start order
 
-1. Start `out.py` on VPS OUT.
-2. Start `in.py` on VPS IN.
-3. Point your client at the SOCKS5 listener on VPS IN: `127.0.0.1:10808`.
+1. Start the Go server binary on VPS OUT: `sudo ./spoof -c server-config.json`
+2. Start the Go client binary on VPS IN: `sudo ./spoof -c client-config.json`
+3. Point your client at the SOCKS5 listener on VPS IN: `127.0.0.1:1080`
 
 ## What good startup logs look like
 
-On `out.py`:
+On the Go server:
 
-- `listening for control TCP on 0.0.0.0:8888`
-- `session=... target=host:port`
-- `status active_sessions=...`
+- `Server listening on port ...`
+- `Transport: udp` or `Transport: syn_udp`
+- `Expected client spoof IP ...`
 
-On `in.py`:
+On the Go client:
 
-- `UDP receiver listening on 10808`
-- `SOCKS5 tunnel listening on 127.0.0.1:10808`
-- `session=... ready target=host:port`
+- `Tunneling to <server-ip>:<port> via ...`
+- `[inbound] SOCKS5 proxy on 127.0.0.1:1080`
 
 ## What fails most often
 
 - Placeholder IPs were not replaced
 - VPS OUT cannot reach the target host or port
 - VPS IN cannot reach the SOCKS5 proxy on `127.0.0.1:18001`
-- `out.py` does not have permission to send raw packets
+- `spoof` does not have permission to send raw packets
 - Firewalls or security groups block TCP `8888` or UDP `10808`
 - The target path is lossy enough that retransmits hit the retry limit
-- SOCKS5 UDP ASSOCIATE is currently rejected by `in.py`; disable UDP/QUIC in the client or add UDP support before expecting DNS-over-UDP to work
+- SOCKS5 UDP ASSOCIATE is currently rejected by the Go client; disable UDP/QUIC in the client or add UDP support before expecting DNS-over-UDP to work
 
 ## Notes
 
@@ -73,26 +76,26 @@ The tunnel now uses framed control messages, session IDs, ACKs, and retransmits 
 
 This reduces unnecessary retransmissions when packets arrive out of order.
 
-## Downstream acceleration with Go sender
+## Go-only operation
 
-`out.py` can now use a Go-based downstream sender from `spoof-tunnel` to emit spoofed UDP packets faster than Scapy.
+If you want to remove Python from the runtime entirely, use only the Go binary on both ends.
 
-- Upstream is unchanged and still goes through SOCKS5 `127.0.0.1:18001`
-- Only OUT -> IN UDP downstream send path is switched to Go
-- If Go build/start fails, `out.py` automatically falls back to the previous Python send path
+- Build `spoof` once and deploy it to both VPS IN and VPS OUT
+- Do not run `out.py` or `in.py`
+- Use `server-config.json` on VPS OUT and `client-config.json` on VPS IN
+- The Go binary covers spoofing, reliability, transport, SOCKS5 inbound, and direct relay paths
 
-New `out_config.json` keys:
+Recommended OUT systemd command:
 
-- `go_downstream_sender_enabled` (default `true`)
-- `go_sender_project_dir` (default `spoof-tunnel`)
-- `go_sender_build_dir` (default `.go-bin`)
-- `go_sender_binary_name` (default `downstream-sender`)
-- `go_sender_send_only` (default `true`)
+```bash
+sudo ./spoof -c server-config.json
+```
 
-Requirements for acceleration on VPS OUT:
+Recommended IN systemd command:
 
-- Go toolchain installed (`go` in `PATH`)
-- Raw packet permission (root or equivalent capabilities)
+```bash
+sudo ./spoof -c client-config.json
+```
 
 ## Recommended production tuning
 

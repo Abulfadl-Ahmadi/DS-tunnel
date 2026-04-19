@@ -19,8 +19,11 @@ from typing import Optional
 
 try:
     from scapy.all import IP, UDP, send
-except ImportError as exc:  # pragma: no cover - runtime dependency check
-    raise SystemExit("Scapy is required. Install dependencies with: pip install -r requirements.txt") from exc
+    SCAPY_AVAILABLE = True
+    SCAPY_IMPORT_ERROR: Optional[Exception] = None
+except ImportError as exc:  # pragma: no cover - optional fallback dependency
+    SCAPY_AVAILABLE = False
+    SCAPY_IMPORT_ERROR = exc
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [OUT] %(message)s")
 log = logging.getLogger(__name__)
@@ -56,6 +59,7 @@ DEFAULT_CONFIG = {
     "go_sender_build_dir": ".go-bin",
     "go_sender_binary_name": "downstream-sender",
     "go_sender_send_only": True,
+    "go_downstream_sender_required": False,
     "go_binary_path": "",
 }
 
@@ -159,6 +163,7 @@ GO_SENDER_PROJECT_DIR = str(CONFIG.get("go_sender_project_dir", "spoof-tunnel"))
 GO_SENDER_BUILD_DIR = str(CONFIG.get("go_sender_build_dir", ".go-bin"))
 GO_SENDER_BINARY_NAME = str(CONFIG.get("go_sender_binary_name", "downstream-sender"))
 GO_SENDER_SEND_ONLY = parse_bool(CONFIG.get("go_sender_send_only", True), True)
+GO_DOWNSTREAM_SENDER_REQUIRED = parse_bool(CONFIG.get("go_downstream_sender_required", False), False)
 GO_BINARY_PATH = str(CONFIG.get("go_binary_path", "")).strip()
 
 MAGIC = b"HTUN"
@@ -188,6 +193,12 @@ def validate_configuration() -> None:
     log.info("Configured UDP MTU=%s, max payload=%s bytes", UDP_MTU, MAX_UDP_PAYLOAD)
     log.info("Raw UDP will be sent with spoofed source=%s to destination=%s:%s", SPOOF_IP, VPS_IN_IP, UDP_PORT)
     log.info(
+        "Downstream sender mode: enabled=%s send_only=%s required=%s",
+        GO_DOWNSTREAM_SENDER_ENABLED,
+        GO_SENDER_SEND_ONLY,
+        GO_DOWNSTREAM_SENDER_REQUIRED,
+    )
+    log.info(
         "Retransmit scan=%ss max_resends_per_tick=%s max_pending_chunks=%s recv_size=%s socket_buffer=%s close_grace=%s udp_plain_fallback=%s",
         RETRANSMIT_SCAN_INTERVAL,
         MAX_RESENDS_PER_TICK,
@@ -197,6 +208,8 @@ def validate_configuration() -> None:
         SESSION_CLOSE_GRACE,
         UDP_PLAIN_FALLBACK_ENABLED,
     )
+    if GO_DOWNSTREAM_SENDER_REQUIRED and UDP_PLAIN_FALLBACK_ENABLED:
+        log.info("go_downstream_sender_required=true, Python UDP fallback path will be ignored")
     log.info("Runtime logs are being written to %s", LOG_FILE_PATH)
 
 
@@ -361,14 +374,14 @@ def build_go_sender_binary() -> Optional[Path]:
     return binary_path
 
 
-def init_go_sender() -> None:
+def init_go_sender() -> bool:
     global go_sender
     if not GO_DOWNSTREAM_SENDER_ENABLED:
-        return
+        return False
 
     binary_path = build_go_sender_binary()
     if binary_path is None:
-        return
+        return False
 
     command = [
         str(binary_path),
@@ -397,6 +410,7 @@ def init_go_sender() -> None:
     except Exception as exc:
         log.warning("failed to start go downstream sender (%s); using Python send path", exc)
         go_sender = None
+    return go_sender is not None
 
 
 def disable_go_sender(reason: str) -> None:
@@ -543,7 +557,7 @@ def close_session(session: SessionState, reason: str) -> None:
 
 def send_udp_chunk(session: SessionState, seq_num: int, payload: bytes, flags: int = 0) -> None:
     packet = UDP_HEADER.pack(MAGIC, session.session_id, seq_num, flags, len(payload)) + payload
-    if GO_SENDER_SEND_ONLY:
+    if GO_SENDER_SEND_ONLY or GO_DOWNSTREAM_SENDER_REQUIRED:
         with go_sender_lock:
             active_sender = go_sender
         if active_sender is not None:
@@ -552,17 +566,24 @@ def send_udp_chunk(session: SessionState, seq_num: int, payload: bytes, flags: i
                 return
             except Exception as exc:
                 disable_go_sender(f"go sender send failed: {exc}")
+                if GO_DOWNSTREAM_SENDER_REQUIRED:
+                    raise RuntimeError(f"go sender required but send failed: {exc}") from exc
+        if GO_DOWNSTREAM_SENDER_REQUIRED:
+            raise RuntimeError("go sender required but unavailable")
 
     sent_any = False
     spoof_error: Optional[Exception] = None
 
-    try:
-        ip_layer = IP(src=SPOOF_IP, dst=VPS_IN_IP)
-        udp_layer = UDP(sport=UDP_PORT, dport=UDP_PORT)
-        send(ip_layer / udp_layer / packet, verbose=False)
-        sent_any = True
-    except Exception as exc:
-        spoof_error = exc
+    if SCAPY_AVAILABLE:
+        try:
+            ip_layer = IP(src=SPOOF_IP, dst=VPS_IN_IP)
+            udp_layer = UDP(sport=UDP_PORT, dport=UDP_PORT)
+            send(ip_layer / udp_layer / packet, verbose=False)
+            sent_any = True
+        except Exception as exc:
+            spoof_error = exc
+    else:
+        spoof_error = RuntimeError(f"scapy unavailable: {SCAPY_IMPORT_ERROR}")
 
     if UDP_PLAIN_FALLBACK_ENABLED:
         try:
@@ -910,7 +931,9 @@ def handle_control_conn(control_sock: socket.socket, client_addr: tuple[str, int
 
 def main() -> None:
     validate_configuration()
-    init_go_sender()
+    go_sender_started = init_go_sender()
+    if GO_DOWNSTREAM_SENDER_REQUIRED and not go_sender_started:
+        raise SystemExit("Go downstream sender is required but failed to initialize")
     threading.Thread(target=log_status_loop, daemon=True).start()
 
     listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
