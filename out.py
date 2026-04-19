@@ -56,6 +56,7 @@ DEFAULT_CONFIG = {
     "go_sender_build_dir": ".go-bin",
     "go_sender_binary_name": "downstream-sender",
     "go_sender_send_only": True,
+    "go_binary_path": "",
 }
 
 
@@ -158,6 +159,7 @@ GO_SENDER_PROJECT_DIR = str(CONFIG.get("go_sender_project_dir", "spoof-tunnel"))
 GO_SENDER_BUILD_DIR = str(CONFIG.get("go_sender_build_dir", ".go-bin"))
 GO_SENDER_BINARY_NAME = str(CONFIG.get("go_sender_binary_name", "downstream-sender"))
 GO_SENDER_SEND_ONLY = parse_bool(CONFIG.get("go_sender_send_only", True), True)
+GO_BINARY_PATH = str(CONFIG.get("go_binary_path", "")).strip()
 
 MAGIC = b"HTUN"
 VERSION = 1
@@ -299,10 +301,30 @@ go_sender: Optional[GoDownstreamSender] = None
 def build_go_sender_binary() -> Optional[Path]:
     if not GO_DOWNSTREAM_SENDER_ENABLED:
         return None
-    go_cmd = shutil.which("go")
+
+    go_candidates: list[str] = []
+    if GO_BINARY_PATH:
+        go_candidates.append(GO_BINARY_PATH)
+    detected_go = shutil.which("go")
+    if detected_go:
+        go_candidates.append(detected_go)
+    go_candidates.extend([
+        "/usr/local/go/bin/go",
+        "/usr/bin/go",
+    ])
+
+    go_cmd: Optional[str] = None
+    for candidate in go_candidates:
+        if candidate and Path(candidate).exists() and os.access(candidate, os.X_OK):
+            go_cmd = candidate
+            break
+
     if go_cmd is None:
-        log.warning("go is not installed; downstream sender disabled, using Python send path")
+        log.warning(
+            "go is not installed or not visible to this service; downstream sender disabled, using Python send path"
+        )
         return None
+    log.info("using go compiler: %s", go_cmd)
 
     project_dir = Path(__file__).parent / GO_SENDER_PROJECT_DIR
     sender_cmd_dir = project_dir / "cmd" / "downstream-sender"
