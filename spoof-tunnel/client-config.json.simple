@@ -1,0 +1,35 @@
+{
+  "mode": "client",
+  "transport": {
+    "type": "syn_udp"
+  },
+  "server": {
+    "address": "VPS_OUT_IP",
+    "port": 8888
+  },
+  "spoof": {
+    "source_ip": "VPS_IN_IP",
+    "peer_spoof_ip": "SPOOF_IP"
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "listen": {
+        "address": "127.0.0.1",
+        "port": 10808
+      }
+    }
+  ],
+  "crypto": {
+    "private_key": "PRIVATE_KEY_HERE_FOR_IN",
+    "peer_public_key": "PEER_PUBLIC_KEY_HERE"
+  },
+  "keepalive": {
+    "enabled": true,
+    "interval_seconds": 30,
+    "timeout_seconds": 120
+  },
+  "logging": {
+    "level": "info"
+  }
+}
